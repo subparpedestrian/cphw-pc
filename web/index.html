@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+
+<head>
+    <meta charset="utf-8">
+    <title>wheel</title>
+    <script>
+        function hexToBytes(hex) {
+            let bytes = [];
+            for (let c = 0; c < hex.length; c += 2)
+                bytes.push(parseInt(hex.substr(c, 2), 16));
+            return new Uint8Array(bytes);
+        }
+
+        function buf2hex(buffer) { // buffer is an ArrayBuffer
+            return [...new Uint8Array(buffer)]
+                .map(x => x.toString(16).padStart(2, '0'))
+                .join('');
+        }
+
+        function sleeper(ms) {
+            return function (x) {
+                return new Promise(resolve => setTimeout(() => resolve(x), ms));
+            };
+        }
+
+        class Cphw {
+            static CPHW_SERVICE_UUID = '52756265-6e43-6167-6e69-654350485000'
+            static CPHW_OTHER_UUID = '52756265-6e43-6167-6e69-654350485001'
+            static CPHW_SERVICE_UUID_100 = '52756265-6e43-6167-6e69-654350485100'
+            static AUTH_REQUEST_UUID = '52756265-6e43-6167-6e69-654350485101'
+            static AUTH_STATUS_UUID = '52756265-6e43-6167-6e69-654350485104'
+            static BOARD_SERIAL_UUID = '52756265-6e43-6167-6e69-654350485105'
+            static BOOTLOADER_SERVICE_UUID = '52756265-6e43-6167-6e69-654350485200'
+            static BOOTLOADER_RESPONSE_UUID = '52756265-6e43-6167-6e69-654350485201'
+            static BOOTLOADER_UPLOAD_UUID = '52756265-6e43-6167-6e69-654350485202'
+            static BOOTLOADER_FLASH_UUID = '52756265-6e43-6167-6e69-654350485203'
+            static BOOTLOADER_VERSION_UUID = '52756265-6e43-6167-6e69-654350485204'
+
+            constructor() {
+                this.device = null;
+                this.onDisconnected = this.onDisconnected.bind(this);
+                this.serial = '';
+                this.eraseData = [];
+                this.programBlocks = [];
+                this.updateState = 'init';
+                this.activeBlock = 0;
+            }
+
+            async request() {
+                let options = {
+                    "filters": [{
+                        "services": [Cphw.CPHW_SERVICE_UUID]
+                    }],
+                    "optionalServices": [Cphw.BOOTLOADER_SERVICE_UUID, Cphw.CPHW_SERVICE_UUID_100]
+                };
+                return navigator.bluetooth.requestDevice(options)
+                    .then(device => {
+                        this.device = device;
+                        this.device.addEventListener('gattserverdisconnected', this.onDisconnected);
+                    });
+            }
+
+            async connect() {
+                if (!this.device) {
+                    return Promise.reject('Device is not connected.');
+                }
+                console.log('connecting...')
+                return this.device.gatt.connect();
+            }
+
+            async readSerial() {
+                return this.device.gatt.getPrimaryService(Cphw.CPHW_SERVICE_UUID_100)
+                    .then(service => service.getCharacteristic(Cphw.BOARD_SERIAL_UUID))
+                    .then(characteristic => characteristic.readValue());
+            }
+
+            async writePasscode(data) {
+                return this.device.gatt.getPrimaryService(Cphw.CPHW_SERVICE_UUID_100)
+                    .then(service => service.getCharacteristic(Cphw.AUTH_REQUEST_UUID))
+                    .then(characteristic => characteristic.writeValue(data))
+            }
+
+            async readAuthStatus() {
+                return this.device.gatt.getPrimaryService(Cphw.CPHW_SERVICE_UUID_100)
+                    .then(service => service.getCharacteristic(Cphw.AUTH_STATUS_UUID))
+                    .then(characteristic => characteristic.readValue());
+            }
+
+            async startBootloaderNotifications(listener) {
+                return this.device.gatt.getPrimaryService(Cphw.BOOTLOADER_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.BOOTLOADER_RESPONSE_UUID))
+                    .then(characteristic => characteristic.startNotifications())
+                    .then(characteristic => characteristic.addEventListener('characteristicvaluechanged', listener));
+            }
+
+            async stopBootloaderNotifications(listener) {
+                return this.device.gatt.getPrimaryService(Cphw.BOOTLOADER_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.BOOTLOADER_RESPONSE_UUID))
+                    .then(characteristic => characteristic.stopNotifications())
+                    .then(characteristic => characteristic.removeEventListener('characteristicvaluechanged', listener));
+            }
+
+            async disconnect() {
+                if (!this.device) {
+                    return Promise.reject('Device is not connected.');
+                }
+                return this.device.gatt.disconnect();
+            }
+
+            onDisconnected() {
+                console.log('Device is disconnected.');
+            }
+
+            async resetToBootloader() {
+                console.log('sending reset to bootloader command')
+                return this.device.gatt.getPrimaryService(Cphw.CPHW_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.CPHW_OTHER_UUID))
+                    .then(characteristic => characteristic.writeValue(hexToBytes('F00101')))
+                    .then(sleeper(2000));
+            }
+
+            async resetToApp() {
+                console.log('sending reset to app command')
+                return this.device.gatt.getPrimaryService(Cphw.BOOTLOADER_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.BOOTLOADER_FLASH_UUID))
+                    .then(characteristic => characteristic.writeValue(hexToBytes('F90101')))
+            }
+
+            async checkChecksum() {
+                this.updateState = 'checksumming'
+                return this.device.gatt.getPrimaryService(Cphw.BOOTLOADER_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.BOOTLOADER_FLASH_UUID))
+                    .then(characteristic => characteristic.writeValue(hexToBytes('FB')))
+            }
+
+            async authenticate() {
+                return this.readSerial()
+                    .then(value => {
+                        const decoder = new TextDecoder();
+                        this.serial = decoder.decode(value.buffer.slice(0, 14))
+                        console.log("serial: " + this.serial)
+                        return fetch('./passcodes.csv');
+                    })
+                    .then(rsp => {
+                        return rsp.text();
+                    })
+                    .then(lines => {
+                        var passcode = 'FF'
+                        for (let line of lines.split('\n')) {
+                            if (line.split(',')[0] == this.serial) {
+                                passcode = line.split(',')[1];
+                                break
+                            }
+                        }
+                        return this.writePasscode(hexToBytes(passcode))
+                            .then(sleeper(500))
+                            .then(_ => { return this.readAuthStatus(); })
+                            .then(data => console.log("authentication state: " + data.getUint8(0)))
+                    })
+            }
+
+            async requestErase() {
+                this.updateState = 'erasing'
+                await console.log('erasing flash block(s)')
+                return this.device.gatt.getPrimaryService(Cphw.BOOTLOADER_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.BOOTLOADER_FLASH_UUID))
+                    .then(characteristic => characteristic.writeValue(this.eraseData))
+            }
+
+            async programBlock(i) {
+                this.updateState = 'programming'
+                return this.device.gatt.getPrimaryService(Cphw.BOOTLOADER_SERVICE_UUID)
+                    .then(service => service.getCharacteristic(Cphw.BOOTLOADER_UPLOAD_UUID))
+                    .then(characteristic => characteristic.writeValue(this.programBlocks[i]))
+            }
+
+            async doTheThing() {
+                await this.request();
+                await this.connect();
+                console.log('connected');
+                await this.authenticate();
+                await this.resetToBootloader();
+                await console.log("disconnecting so we can reconnect...")
+                await this.disconnect();
+                await sleeper(1000);
+                await this.request();
+                await this.connect();
+                await console.log('connected')
+                await this.authenticate();
+                await this.startBootloaderNotifications(notificationHandler);
+                await this.getAndParseFile();
+                await this.requestErase();
+            }
+
+            async getAndParseFile() {
+                var rsp = await fetch('./firmware.bin', {
+                    method: "GET",
+                    headers: {
+                        'Content-Type': 'application/octet-stream',
+                    },
+                    responseType: "arraybuffer"
+                })
+                var bin = await rsp.arrayBuffer()
+                this.eraseData = bin.slice(0, 10)
+                bin = bin.slice(10)
+                for (let i = 0; i < bin.byteLength / 64; i++) {
+                    this.programBlocks.push(bin.slice(i * 64, (i + 1) * 64))
+                }
+            }
+        }
+
+        var cphw = new Cphw();
+        var foo = [];
+
+        async function notificationHandler(event) {
+            await console.log(buf2hex(event.target.value.buffer));
+            // cphw.resetTimeout();
+            switch (cphw.updateState) {
+                case 'erasing':
+                    return doProgram();
+                    break;
+                case 'programming':
+                    return doProgram();
+                    break;
+                case 'checksumming':
+                    cphw.updateState = 'init';
+                    return cphw.resetToApp()
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        async function doProgram() {
+            if (cphw.activeBlock < cphw.programBlocks.length) {
+                await console.log(cphw.activeBlock);
+                await console.log("Programming block " + (cphw.activeBlock + 1) + " of " + cphw.programBlocks.length)
+                await cphw.programBlock(cphw.activeBlock++);
+                // await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            else {
+
+                await console.log("program complete, check check checksum");
+                await cphw.checkChecksum();
+            }
+
+        }
+
+        window.onload = function () {
+            document.querySelector('#connectButton').addEventListener('click', () => cphw.doTheThing());
+
+            // document.querySelector('#disconnectButton').addEventListener('click', event => {
+            //     cphw.disconnect();
+            // });
+        };
+    </script>
+</head>
+
+<body>
+    <button id='connectButton'>connect</button>
+    <!-- <button id='disconnectButton'>disconnect</button> -->
+</body>
+
+</html>
