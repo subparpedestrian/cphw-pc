@@ -183,7 +183,9 @@
                 await this.resetToBootloader();
                 await console.log("disconnecting so we can reconnect...")
                 await this.disconnect();
-                await sleeper(1000);
+            }
+
+            async doTheThingBootloader() {
                 await this.request();
                 await this.connect();
                 await console.log('connected')
@@ -249,17 +251,14 @@
 
         window.onload = function () {
             document.querySelector('#connectButton').addEventListener('click', () => cphw.doTheThing());
-
-            // document.querySelector('#disconnectButton').addEventListener('click', event => {
-            //     cphw.disconnect();
-            // });
+            document.querySelector('#programButton').addEventListener('click', () => cphw.doTheThingBootloader());
         };
     </script>
 </head>
 
 <body>
-    <button id='connectButton'>GO</button>
-    <!-- <button id='disconnectButton'>disconnect</button> -->
+    <button id='connectButton'>RESET TO BOOTLOADER</button>
+    <button id='programButton'>START PROGRAMMING</button>
 </body>
 
 </html>
